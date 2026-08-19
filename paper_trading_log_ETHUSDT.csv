@@ -1,0 +1,2 @@
+timestamp,funding_time,price,sma_150_8h,funding_rate,signal,equity,realized_pnl_period,funding_captured,fees_paid,slippage_assumption,cum_ret_pct,drawdown_pct,api_status
+2026-08-19T13:47:15.166525+00:00,2026-07-31 16:00:00+00:00,1861.68,1918.788933333333,-2.045e-05,FLAT,122763.36222457465,-0.0,-0.0,0.0,0.0,22.763362224574646,3.658970529105622,SUCCESS
