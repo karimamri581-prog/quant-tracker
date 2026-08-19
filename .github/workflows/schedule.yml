@@ -1,0 +1,37 @@
+name: Quant Paper Trader
+
+on:
+  schedule:
+    # Run every 8 hours at 00:00, 08:00, 16:00 UTC
+    - cron: "0 0,8,16 * * *"
+  workflow_dispatch: # Allows you to run it manually from the GitHub UI
+
+jobs:
+  run-trader:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to allow the bot to commit the updated CSV
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          
+      - name: Install dependencies
+        run: |
+          pip install pandas requests
+          
+      - name: Run Paper Trader
+        run: |
+          python paper_trader.py
+          
+      - name: Commit and push log file
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add paper_trading_log.csv
+          git commit -m "Update paper trading log" || echo "No changes to commit"
+          git push
