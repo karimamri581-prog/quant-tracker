@@ -1,6 +1,8 @@
 import requests
 import pandas as pd
 import numpy as np
+import zipfile
+import io
 import os
 from datetime import datetime, timezone, timedelta
 
@@ -9,53 +11,66 @@ LOG_FILE = "paper_trading_log.csv"
 INITIAL_CAPITAL = 100000.0
 TRADE_COST_PCT = 0.0014 # 0.14% per side
 
-def fetch_api(url, params):
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-def get_klines(symbol, interval, start_time, end_time):
-    url = "https://api.binance.com/api/v3/klines"
+def get_bulk_data(symbol, data_type, start_year):
     all_data = []
-    current = start_time
-    while current < end_time:
-        params = {"symbol": symbol, "interval": interval, "startTime": int(current.timestamp() * 1000), "endTime": int(end_time.timestamp() * 1000), "limit": 1000}
-        data = fetch_api(url, params)
-        if not data: break
-        all_data.extend(data)
-        current = pd.to_datetime(data[-1][0], unit="ms", utc=True) + pd.Timedelta(milliseconds=1)
-    df = pd.DataFrame(all_data, columns=["open_time", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "tbbav", "tbqav", "ignore"])
-    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close"] = df["close"].astype(float)
-    return df[["timestamp", "close"]]
+    current_date = datetime.now(timezone.utc)
+    cols = ["open_time", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "tbbav", "tbqav", "ignore"]
+    
+    for y in range(start_year, current_date.year + 1):
+        for m in range(1, 13):
+            if y == current_date.year and m > current_date.month: continue
+            mm = f"{m:02d}"
+            
+            if data_type == "funding":
+                url = f"https://data.binance.vision/data/futures/um/monthly/fundingRate/{symbol}/{symbol}-fundingRate-{y}-{mm}.zip"
+            else:
+                url = f"https://data.binance.vision/data/futures/um/monthly/klines/{symbol}/1h/{symbol}-1h-{y}-{mm}.zip"
+            
+            try:
+                r = requests.get(url, timeout=15)
+                if r.status_code == 200:
+                    z = zipfile.ZipFile(io.BytesIO(r.content))
+                    df = pd.read_csv(z.open(z.namelist()[0]))
+                    
+                    if data_type == "funding":
+                        time_col = 'calcTime' if 'calcTime' in df.columns else 'calc_time'
+                        rate_col = 'fundingRate' if 'fundingRate' in df.columns else 'last_funding_rate'
+                        df["timestamp"] = pd.to_datetime(df[time_col], unit="ms", utc=True, errors="coerce")
+                        df["funding_rate"] = pd.to_numeric(df[rate_col], errors="coerce")
+                        all_data.append(df.dropna(subset=["timestamp", "funding_rate"])[["timestamp", "funding_rate"]])
+                    else:
+                        df.columns = cols
+                        df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+                        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+                        all_data.append(df.dropna(subset=["close"])[["timestamp", "close"]])
+            except:
+                pass
 
-def get_funding(symbol, start_time, end_time):
-    url = "https://fapi.binance.com/fapi/v1/fundingRate"
-    all_data = []
-    current = start_time
-    while current < end_time:
-        params = {"symbol": symbol, "startTime": int(current.timestamp() * 1000), "endTime": int(end_time.timestamp() * 1000), "limit": 1000}
-        data = fetch_api(url, params)
-        if not data: break
-        all_data.extend(data)
-        current = pd.to_datetime(data[-1]["fundingTime"], unit="ms", utc=True) + pd.Timedelta(milliseconds=1)
-    df = pd.DataFrame(all_data)
-    df["timestamp"] = pd.to_datetime(df["fundingTime"], unit="ms", utc=True)
-    df["funding_rate"] = df["fundingRate"].astype(float)
-    return df[["timestamp", "funding_rate"]]
+    if not all_data: return pd.DataFrame()
+    return pd.concat(all_data).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
 def run_logic():
-    end_time = datetime.now(timezone.utc)
-    start_time = end_time - timedelta(days=365*5) # 5 years of data
+    print("Fetching historical funding...")
+    funding = get_bulk_data(SYMBOL, "funding", 2020)
+    print(f"  Funding rows: {len(funding)}")
     
     print("Fetching historical klines...")
-    klines = get_klines(SYMBOL, "8h", start_time, end_time)
-    print("Fetching historical funding...")
-    funding = get_funding(SYMBOL, start_time, end_time)
+    klines_1h = get_bulk_data(SYMBOL, "klines", 2020)
+    if klines_1h.empty: 
+        print("Error: Klines empty. Binance Vision might be down.")
+        return
+        
+    # Resample 1h to 8h
+    klines_8h = klines_1h.set_index("timestamp").resample("8h").last().dropna().reset_index()
+    print(f"  8h Klines rows: {len(klines_8h)}")
     
     # Merge
-    df = pd.merge(funding, klines, on="timestamp", how="inner")
+    df = pd.merge(funding, klines_8h, on="timestamp", how="inner")
     df = df.sort_values("timestamp").reset_index(drop=True)
+    
+    if df.empty:
+        print("Error: Merged dataframe is empty.")
+        return
     
     # Backtest Logic (Candidate C)
     df["sma"] = df["close"].rolling(150).mean()
