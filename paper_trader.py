@@ -10,6 +10,7 @@ SYMBOL = "BTCUSDT"
 LOG_FILE = "paper_trading_log.csv"
 INITIAL_CAPITAL = 100000.0
 TRADE_COST_PCT = 0.0014 # 0.14% per side
+SLIPPAGE_ASSUMPTION = 0.0005 # 0.05% per side
 
 def get_bulk_data(symbol, data_type, start_year):
     all_data = []
@@ -77,15 +78,16 @@ def run_logic():
     df["signal"] = np.where(df["close"] > df["sma"], 1, 0)
     df["signal"] = df["signal"].shift(1)
     
-    df["strat_ret"] = df["signal"] * df["funding_rate"]
+    df["funding_captured"] = df["signal"] * df["funding_rate"]
     df["trade"] = df["signal"].diff().abs()
-    df["cost"] = df["trade"] * TRADE_COST_PCT
-    df["net_ret"] = df["strat_ret"] - df["cost"]
+    df["fees"] = df["trade"] * TRADE_COST_PCT
+    df["slippage"] = df["trade"] * SLIPPAGE_ASSUMPTION
+    df["net_ret"] = df["funding_captured"] - df["fees"] - df["slippage"]
     
     # Calculate Equity Curve
     df["equity"] = INITIAL_CAPITAL * (1 + df["net_ret"]).cumprod()
     df["peak"] = df["equity"].cummax()
-    df["drawdown"] = (df["peak"] - df["equity"]) / df["peak"]
+    df["drawdown_pct"] = ((df["peak"] - df["equity"]) / df["peak"]) * 100
     
     # Get the most recent row
     last_row = df.iloc[-1]
@@ -98,8 +100,13 @@ def run_logic():
         "funding_rate": float(last_row["funding_rate"]),
         "signal": "HOLD" if last_row["signal"] == 1.0 else "FLAT",
         "equity": float(last_row["equity"]),
+        "realized_pnl_period": float(last_row["net_ret"]),
+        "funding_captured": float(last_row["funding_captured"]),
+        "fees_paid": float(last_row["fees"]),
+        "slippage_assumption": float(last_row["slippage"]),
         "cum_ret_pct": ((float(last_row["equity"]) / INITIAL_CAPITAL) - 1) * 100,
-        "drawdown_pct": float(last_row["drawdown"] * 100)
+        "drawdown_pct": float(last_row["drawdown_pct"]),
+        "api_status": "SUCCESS"
     }
     
     # Append to CSV
