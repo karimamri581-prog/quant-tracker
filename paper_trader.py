@@ -7,11 +7,10 @@ import os
 from datetime import datetime, timezone
 
 INITIAL_CAPITAL = 100000.0
-FIXED_NOTIONAL = 100000.0
 TRADE_COST_PCT = 0.0014
 SLIPPAGE_ASSUMPTION = 0.0005
 MAX_DRAWDOWN_LIMIT = 5.0
-STRATEGY_VERSION = "Candidate_C_v1.1_Fixed_Accounting"
+STRATEGY_VERSION = "Candidate_C_v1.2_Units_Fixed"
 
 def get_bulk_data(symbol, data_type, start_year):
     all_data = []
@@ -61,12 +60,10 @@ def run_logic_for_symbol(symbol):
     df = pd.merge(funding, klines_8h, on="timestamp", how="inner")
     df = df.sort_values("timestamp").reset_index(drop=True)
     
-    # Strategy Logic
     df["sma"] = df["close"].rolling(150).mean()
     df["signal"] = np.where(df["close"] > df["sma"], 1, 0)
     df["signal"] = df["signal"].shift(1)
     
-    # Identify Trade Entries/Exits
     df["trade"] = df["signal"].diff().abs()
     trade_points = df[df["trade"] != 0].copy()
     
@@ -84,22 +81,22 @@ def run_logic_for_symbol(symbol):
         entry_price = entry["close"]
         exit_price = exit["close"]
         side = "Long Spot / Short Perp" if entry["signal"] == 1 else "Flat"
-        notional = FIXED_NOTIONAL
         
-        # FIX: Gross P&L is 0.0 (Market Neutral)
-        gross_pnl = 0.0
+        # FIX: Calculate Quantity and Dollar Value
+        quantity = INITIAL_CAPITAL / entry_price
+        notional_value = INITIAL_CAPITAL
         
-        # Funding P&L
+        gross_pnl = 0.0 # Market Neutral
+        
         hold_df = df[(df["timestamp"] > entry_time) & (df["timestamp"] <= exit_time)]
-        funding_pnl = hold_df["funding_rate"].sum() * notional
+        funding_pnl = hold_df["funding_rate"].sum() * notional_value
         
-        # Costs
-        fees = (entry_price * notional * TRADE_COST_PCT) + (exit_price * notional * TRADE_COST_PCT)
-        slippage = (entry_price * notional * SLIPPAGE_ASSUMPTION) + (exit_price * notional * SLIPPAGE_ASSUMPTION)
+        # FIX: Fees and Slippage based on Dollar Value
+        fees = notional_value * TRADE_COST_PCT * 2 # Entry + Exit
+        slippage = notional_value * SLIPPAGE_ASSUMPTION * 2 # Entry + Exit
         
         net_pnl = gross_pnl + funding_pnl - fees - slippage
         
-        # Circuit Breaker Check
         status = "SUCCESS"
         if current_equity + net_pnl < 0:
             net_pnl = -current_equity
@@ -121,7 +118,8 @@ def run_logic_for_symbol(symbol):
             "Side": side,
             "Entry price": float(entry_price),
             "Exit price": float(exit_price),
-            "Notional": float(notional),
+            "Quantity": float(quantity),
+            "Notional": float(notional_value),
             "Gross P&L": float(gross_pnl),
             "Funding P&L": float(funding_pnl),
             "Fees": float(fees),
@@ -144,7 +142,7 @@ def run_logic_for_symbol(symbol):
     print(f"Trade Journal updated for {symbol} with {len(log_df)} trades.")
 
 if __name__ == "__main__":
-    print("Starting Multi-Symbol Paper Trader (Fixed Accounting)...")
+    print("Starting Multi-Symbol Paper Trader (Units Fixed)...")
     run_logic_for_symbol("BTCUSDT")
     run_logic_for_symbol("ETHUSDT")
     print("Run complete.")
