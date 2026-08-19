@@ -7,9 +7,9 @@ import os
 from datetime import datetime, timezone
 
 INITIAL_CAPITAL = 100000.0
-TRADE_COST_PCT = 0.0014 # 0.14% per side
-SLIPPAGE_ASSUMPTION = 0.0005 # 0.05% per side
-MAX_DRAWDOWN_LIMIT = 5.0 # Layer 3: Circuit Breaker
+TRADE_COST_PCT = 0.0014
+SLIPPAGE_ASSUMPTION = 0.0005
+SYMBOL = "BTCUSDT"
 
 def get_bulk_data(symbol, data_type, start_year):
     all_data = []
@@ -49,67 +49,87 @@ def get_bulk_data(symbol, data_type, start_year):
     if not all_data: return pd.DataFrame()
     return pd.concat(all_data).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
-def run_logic_for_symbol(symbol):
-    print(f"--- Processing {symbol} ---")
-    funding = get_bulk_data(symbol, "funding", 2020)
-    klines_1h = get_bulk_data(symbol, "klines", 2020)
-    if klines_1h.empty: 
-        print(f"Error: Klines empty for {symbol}.")
-        return
+def run_logic():
+    print(f"Fetching data for {SYMBOL}...")
+    funding = get_bulk_data(SYMBOL, "funding", 2020)
+    klines_1h = get_bulk_data(SYMBOL, "klines", 2020)
+    if klines_1h.empty: return
         
     klines_8h = klines_1h.set_index("timestamp").resample("8h").last().dropna().reset_index()
     df = pd.merge(funding, klines_8h, on="timestamp", how="inner")
     df = df.sort_values("timestamp").reset_index(drop=True)
     
-    if df.empty: return
-    
+    # Strategy Logic
     df["sma"] = df["close"].rolling(150).mean()
     df["signal"] = np.where(df["close"] > df["sma"], 1, 0)
     df["signal"] = df["signal"].shift(1)
     
-    df["funding_captured"] = df["signal"] * df["funding_rate"]
+    # Identify Trade Entries/Exits
     df["trade"] = df["signal"].diff().abs()
-    df["fees"] = df["trade"] * TRADE_COST_PCT
-    df["slippage"] = df["trade"] * SLIPPAGE_ASSUMPTION
-    df["net_ret"] = df["funding_captured"] - df["fees"] - df["slippage"]
+    trade_points = df[df["trade"] != 0].copy()
     
-    df["equity"] = INITIAL_CAPITAL * (1 + df["net_ret"]).cumprod()
-    df["peak"] = df["equity"].cummax()
-    df["drawdown_pct"] = ((df["peak"] - df["equity"]) / df["peak"]) * 100
+    trades = []
+    current_equity = INITIAL_CAPITAL
+    peak_equity = INITIAL_CAPITAL
+    trade_id = 1
     
-    last_row = df.iloc[-1]
+    # Simulate trades
+    for i in range(0, len(trade_points) - 1, 2):
+        entry = trade_points.iloc[i]
+        exit = trade_points.iloc[i+1] if (i+1) < len(trade_points) else df.iloc[-1]
+        
+        entry_time = entry["timestamp"]
+        exit_time = exit["timestamp"]
+        entry_price = entry["close"]
+        exit_price = exit["close"]
+        side = "Long" if entry["signal"] == 1 else "Short"
+        position_size = current_equity
+        leverage = 1.0
+        
+        gross_pnl = (exit_price - entry_price) / entry_price * position_size if side == "Long" else (entry_price - exit_price) / entry_price * position_size
+        
+        hold_df = df[(df["timestamp"] > entry_time) & (df["timestamp"] <= exit_time)]
+        funding_pnl = hold_df["funding_rate"].sum() * position_size
+        
+        fees = (entry_price * position_size * TRADE_COST_PCT) + (exit_price * position_size * TRADE_COST_PCT)
+        slippage = (entry_price * position_size * SLIPPAGE_ASSUMPTION) + (exit_price * position_size * SLIPPAGE_ASSUMPTION)
+        
+        net_pnl = gross_pnl + funding_pnl - fees - slippage
+        current_equity += net_pnl
+        peak_equity = max(peak_equity, current_equity)
+        drawdown = ((peak_equity - current_equity) / peak_equity) * 100
+        
+        trades.append({
+            "Trade ID": trade_id,
+            "Symbol": SYMBOL,
+            "Entry timestamp": str(entry_time),
+            "Exit timestamp": str(exit_time),
+            "Side": side,
+            "Entry price": float(entry_price),
+            "Exit price": float(exit_price),
+            "Position size": float(position_size),
+            "Leverage": leverage,
+            "Gross P&L": float(gross_pnl),
+            "Funding P&L": float(funding_pnl),
+            "Fees": float(fees),
+            "Slippage": float(slippage),
+            "Net P&L": float(net_pnl),
+            "Equity after trade": float(current_equity),
+            "Drawdown": float(drawdown),
+            "Signal": "HOLD_CARRY" if side == "Long" else "FLAT",
+            "API/execution status": "SUCCESS"
+        })
+        trade_id += 1
+
+    log_df = pd.DataFrame(trades)
+    log_file = "trade_journal.csv"
     
-    # Layer 3: Circuit Breaker
-    final_signal = "HOLD" if last_row["signal"] == 1.0 else "FLAT"
-    if last_row["drawdown_pct"] > MAX_DRAWDOWN_LIMIT:
-        final_signal = "FLAT (CIRCUIT BREAKER TRIGGERED)"
-    
-    log_data = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "funding_time": str(last_row["timestamp"]),
-        "price": float(last_row["close"]),
-        "sma_150_8h": float(last_row["sma"]),
-        "funding_rate": float(last_row["funding_rate"]),
-        "signal": final_signal,
-        "equity": float(last_row["equity"]),
-        "realized_pnl_period": float(last_row["net_ret"]),
-        "funding_captured": float(last_row["funding_captured"]),
-        "fees_paid": float(last_row["fees"]),
-        "slippage_assumption": float(last_row["slippage"]),
-        "cum_ret_pct": ((float(last_row["equity"]) / INITIAL_CAPITAL) - 1) * 100,
-        "drawdown_pct": float(last_row["drawdown_pct"]),
-        "api_status": "SUCCESS"
-    }
-    
-    log_file = f"paper_trading_log_{symbol}.csv"
-    log_df = pd.DataFrame([log_data])
+    if len(log_df) > 50:
+        log_df = log_df.tail(50)
+        
     write_header = not os.path.exists(log_file)
-    log_df.to_csv(log_file, mode="a", header=write_header, index=False)
-    print(f"Logged {symbol}: {log_data}")
+    log_df.to_csv(log_file, mode="w", header=True, index=False)
+    print(f"Trade Journal updated with {len(log_df)} trades.")
 
 if __name__ == "__main__":
-    print("Starting Multi-Symbol Paper Trader...")
-    # Layer 1: Deploy BTC and ETH
-    run_logic_for_symbol("BTCUSDT")
-    run_logic_for_symbol("ETHUSDT")
-    print("Run complete.")
+    run_logic()
