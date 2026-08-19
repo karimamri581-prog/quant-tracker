@@ -7,9 +7,11 @@ import os
 from datetime import datetime, timezone
 
 INITIAL_CAPITAL = 100000.0
+FIXED_NOTIONAL = 100000.0
 TRADE_COST_PCT = 0.0014
 SLIPPAGE_ASSUMPTION = 0.0005
-SYMBOL = "BTCUSDT"
+MAX_DRAWDOWN_LIMIT = 5.0
+STRATEGY_VERSION = "Candidate_C_v1.1_Fixed_Accounting"
 
 def get_bulk_data(symbol, data_type, start_year):
     all_data = []
@@ -49,10 +51,10 @@ def get_bulk_data(symbol, data_type, start_year):
     if not all_data: return pd.DataFrame()
     return pd.concat(all_data).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
-def run_logic():
-    print(f"Fetching data for {SYMBOL}...")
-    funding = get_bulk_data(SYMBOL, "funding", 2020)
-    klines_1h = get_bulk_data(SYMBOL, "klines", 2020)
+def run_logic_for_symbol(symbol):
+    print(f"--- Processing {symbol} ---")
+    funding = get_bulk_data(symbol, "funding", 2020)
+    klines_1h = get_bulk_data(symbol, "klines", 2020)
     if klines_1h.empty: return
         
     klines_8h = klines_1h.set_index("timestamp").resample("8h").last().dropna().reset_index()
@@ -73,7 +75,6 @@ def run_logic():
     peak_equity = INITIAL_CAPITAL
     trade_id = 1
     
-    # Simulate trades
     for i in range(0, len(trade_points) - 1, 2):
         entry = trade_points.iloc[i]
         exit = trade_points.iloc[i+1] if (i+1) < len(trade_points) else df.iloc[-1]
@@ -82,54 +83,68 @@ def run_logic():
         exit_time = exit["timestamp"]
         entry_price = entry["close"]
         exit_price = exit["close"]
-        side = "Long" if entry["signal"] == 1 else "Short"
-        position_size = current_equity
-        leverage = 1.0
+        side = "Long Spot / Short Perp" if entry["signal"] == 1 else "Flat"
+        notional = FIXED_NOTIONAL
         
-        gross_pnl = (exit_price - entry_price) / entry_price * position_size if side == "Long" else (entry_price - exit_price) / entry_price * position_size
+        # FIX: Gross P&L is 0.0 (Market Neutral)
+        gross_pnl = 0.0
         
+        # Funding P&L
         hold_df = df[(df["timestamp"] > entry_time) & (df["timestamp"] <= exit_time)]
-        funding_pnl = hold_df["funding_rate"].sum() * position_size
+        funding_pnl = hold_df["funding_rate"].sum() * notional
         
-        fees = (entry_price * position_size * TRADE_COST_PCT) + (exit_price * position_size * TRADE_COST_PCT)
-        slippage = (entry_price * position_size * SLIPPAGE_ASSUMPTION) + (exit_price * position_size * SLIPPAGE_ASSUMPTION)
+        # Costs
+        fees = (entry_price * notional * TRADE_COST_PCT) + (exit_price * notional * TRADE_COST_PCT)
+        slippage = (entry_price * notional * SLIPPAGE_ASSUMPTION) + (exit_price * notional * SLIPPAGE_ASSUMPTION)
         
         net_pnl = gross_pnl + funding_pnl - fees - slippage
+        
+        # Circuit Breaker Check
+        status = "SUCCESS"
+        if current_equity + net_pnl < 0:
+            net_pnl = -current_equity
+            status = "HALT_NEGATIVE_EQUITY"
+            
         current_equity += net_pnl
         peak_equity = max(peak_equity, current_equity)
         drawdown = ((peak_equity - current_equity) / peak_equity) * 100
         
+        if drawdown > MAX_DRAWDOWN_LIMIT:
+            status = "HALT_CIRCUIT_BREAKER"
+            
         trades.append({
             "Trade ID": trade_id,
-            "Symbol": SYMBOL,
+            "Symbol": symbol,
+            "Strategy Version": STRATEGY_VERSION,
             "Entry timestamp": str(entry_time),
             "Exit timestamp": str(exit_time),
             "Side": side,
             "Entry price": float(entry_price),
             "Exit price": float(exit_price),
-            "Position size": float(position_size),
-            "Leverage": leverage,
+            "Notional": float(notional),
             "Gross P&L": float(gross_pnl),
             "Funding P&L": float(funding_pnl),
             "Fees": float(fees),
             "Slippage": float(slippage),
             "Net P&L": float(net_pnl),
             "Equity after trade": float(current_equity),
-            "Drawdown": float(drawdown),
-            "Signal": "HOLD_CARRY" if side == "Long" else "FLAT",
-            "API/execution status": "SUCCESS"
+            "Drawdown %": float(drawdown),
+            "Signal": "HOLD_CARRY" if side == "Long Spot / Short Perp" else "FLAT",
+            "Status": status
         })
         trade_id += 1
 
     log_df = pd.DataFrame(trades)
-    log_file = "trade_journal.csv"
+    log_file = f"trade_journal_{symbol}.csv"
     
     if len(log_df) > 50:
         log_df = log_df.tail(50)
         
-    write_header = not os.path.exists(log_file)
     log_df.to_csv(log_file, mode="w", header=True, index=False)
-    print(f"Trade Journal updated with {len(log_df)} trades.")
+    print(f"Trade Journal updated for {symbol} with {len(log_df)} trades.")
 
 if __name__ == "__main__":
-    run_logic()
+    print("Starting Multi-Symbol Paper Trader (Fixed Accounting)...")
+    run_logic_for_symbol("BTCUSDT")
+    run_logic_for_symbol("ETHUSDT")
+    print("Run complete.")
