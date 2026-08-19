@@ -4,13 +4,12 @@ import numpy as np
 import zipfile
 import io
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
-SYMBOL = "BTCUSDT"
-LOG_FILE = "paper_trading_log.csv"
 INITIAL_CAPITAL = 100000.0
 TRADE_COST_PCT = 0.0014 # 0.14% per side
 SLIPPAGE_ASSUMPTION = 0.0005 # 0.05% per side
+MAX_DRAWDOWN_LIMIT = 5.0 # Layer 3: Circuit Breaker
 
 def get_bulk_data(symbol, data_type, start_year):
     all_data = []
@@ -50,30 +49,20 @@ def get_bulk_data(symbol, data_type, start_year):
     if not all_data: return pd.DataFrame()
     return pd.concat(all_data).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
-def run_logic():
-    print("Fetching historical funding...")
-    funding = get_bulk_data(SYMBOL, "funding", 2020)
-    print(f"  Funding rows: {len(funding)}")
-    
-    print("Fetching historical klines...")
-    klines_1h = get_bulk_data(SYMBOL, "klines", 2020)
+def run_logic_for_symbol(symbol):
+    print(f"--- Processing {symbol} ---")
+    funding = get_bulk_data(symbol, "funding", 2020)
+    klines_1h = get_bulk_data(symbol, "klines", 2020)
     if klines_1h.empty: 
-        print("Error: Klines empty. Binance Vision might be down.")
+        print(f"Error: Klines empty for {symbol}.")
         return
         
-    # Resample 1h to 8h
     klines_8h = klines_1h.set_index("timestamp").resample("8h").last().dropna().reset_index()
-    print(f"  8h Klines rows: {len(klines_8h)}")
-    
-    # Merge
     df = pd.merge(funding, klines_8h, on="timestamp", how="inner")
     df = df.sort_values("timestamp").reset_index(drop=True)
     
-    if df.empty:
-        print("Error: Merged dataframe is empty.")
-        return
+    if df.empty: return
     
-    # Backtest Logic (Candidate C)
     df["sma"] = df["close"].rolling(150).mean()
     df["signal"] = np.where(df["close"] > df["sma"], 1, 0)
     df["signal"] = df["signal"].shift(1)
@@ -84,13 +73,16 @@ def run_logic():
     df["slippage"] = df["trade"] * SLIPPAGE_ASSUMPTION
     df["net_ret"] = df["funding_captured"] - df["fees"] - df["slippage"]
     
-    # Calculate Equity Curve
     df["equity"] = INITIAL_CAPITAL * (1 + df["net_ret"]).cumprod()
     df["peak"] = df["equity"].cummax()
     df["drawdown_pct"] = ((df["peak"] - df["equity"]) / df["peak"]) * 100
     
-    # Get the most recent row
     last_row = df.iloc[-1]
+    
+    # Layer 3: Circuit Breaker
+    final_signal = "HOLD" if last_row["signal"] == 1.0 else "FLAT"
+    if last_row["drawdown_pct"] > MAX_DRAWDOWN_LIMIT:
+        final_signal = "FLAT (CIRCUIT BREAKER TRIGGERED)"
     
     log_data = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -98,7 +90,7 @@ def run_logic():
         "price": float(last_row["close"]),
         "sma_150_8h": float(last_row["sma"]),
         "funding_rate": float(last_row["funding_rate"]),
-        "signal": "HOLD" if last_row["signal"] == 1.0 else "FLAT",
+        "signal": final_signal,
         "equity": float(last_row["equity"]),
         "realized_pnl_period": float(last_row["net_ret"]),
         "funding_captured": float(last_row["funding_captured"]),
@@ -109,11 +101,15 @@ def run_logic():
         "api_status": "SUCCESS"
     }
     
-    # Append to CSV
+    log_file = f"paper_trading_log_{symbol}.csv"
     log_df = pd.DataFrame([log_data])
-    write_header = not os.path.exists(LOG_FILE)
-    log_df.to_csv(LOG_FILE, mode="a", header=write_header, index=False)
-    print(f"Logged: {log_data}")
+    write_header = not os.path.exists(log_file)
+    log_df.to_csv(log_file, mode="a", header=write_header, index=False)
+    print(f"Logged {symbol}: {log_data}")
 
 if __name__ == "__main__":
-    run_logic()
+    print("Starting Multi-Symbol Paper Trader...")
+    # Layer 1: Deploy BTC and ETH
+    run_logic_for_symbol("BTCUSDT")
+    run_logic_for_symbol("ETHUSDT")
+    print("Run complete.")
