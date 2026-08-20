@@ -6,67 +6,101 @@ import io
 import os
 from datetime import datetime, timezone
 
+SYMBOL = "BTCUSDT"
+LOG_FILE = "trade_journal.csv"
 INITIAL_CAPITAL = 100000.0
 TRADE_COST_PCT = 0.0014
 SLIPPAGE_ASSUMPTION = 0.0005
+STRATEGY_VERSION = "Track_A_v2.0_Spot_Fix"
 MAX_DRAWDOWN_LIMIT = 5.0
-STRATEGY_VERSION = "Candidate_C_v1.2_Units_Fixed"
 
-def get_bulk_data(symbol, data_type, start_year):
+def get_funding_data(symbol, start_year):
     all_data = []
     current_date = datetime.now(timezone.utc)
-    cols = ["open_time", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "tbbav", "tbqav", "ignore"]
-    
     for y in range(start_year, current_date.year + 1):
         for m in range(1, 13):
             if y == current_date.year and m > current_date.month: continue
             mm = f"{m:02d}"
-            
-            if data_type == "funding":
-                url = f"https://data.binance.vision/data/futures/um/monthly/fundingRate/{symbol}/{symbol}-fundingRate-{y}-{mm}.zip"
-            else:
-                url = f"https://data.binance.vision/data/futures/um/monthly/klines/{symbol}/1h/{symbol}-1h-{y}-{mm}.zip"
-            
+            url = f"https://data.binance.vision/data/futures/um/monthly/fundingRate/{symbol}/{symbol}-fundingRate-{y}-{mm}.zip"
             try:
                 r = requests.get(url, timeout=15)
                 if r.status_code == 200:
                     z = zipfile.ZipFile(io.BytesIO(r.content))
                     df = pd.read_csv(z.open(z.namelist()[0]))
-                    
-                    if data_type == "funding":
-                        time_col = 'calcTime' if 'calcTime' in df.columns else 'calc_time'
-                        rate_col = 'fundingRate' if 'fundingRate' in df.columns else 'last_funding_rate'
-                        df["timestamp"] = pd.to_datetime(df[time_col], unit="ms", utc=True, errors="coerce")
-                        df["funding_rate"] = pd.to_numeric(df[rate_col], errors="coerce")
-                        all_data.append(df.dropna(subset=["timestamp", "funding_rate"])[["timestamp", "funding_rate"]])
-                    else:
-                        df.columns = cols
-                        df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-                        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-                        all_data.append(df.dropna(subset=["close"])[["timestamp", "close"]])
+                    time_col = 'calcTime' if 'calcTime' in df.columns else 'calc_time'
+                    rate_col = 'fundingRate' if 'fundingRate' in df.columns else 'last_funding_rate'
+                    df["timestamp"] = pd.to_datetime(df[time_col], unit="ms", utc=True, errors="coerce")
+                    df["funding_rate"] = pd.to_numeric(df[rate_col], errors="coerce")
+                    all_data.append(df.dropna(subset=["timestamp", "funding_rate"])[["timestamp", "funding_rate"]])
             except:
                 pass
-
-    if not all_data: return pd.DataFrame()
+    if not all_data:
+        return pd.DataFrame()
     return pd.concat(all_data).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
-def run_logic_for_symbol(symbol):
-    print(f"--- Processing {symbol} ---")
-    funding = get_bulk_data(symbol, "funding", 2020)
-    klines_1h = get_bulk_data(symbol, "klines", 2020)
-    if klines_1h.empty: return
-        
-    klines_8h = klines_1h.set_index("timestamp").resample("8h").last().dropna().reset_index()
-    df = pd.merge(funding, klines_8h, on="timestamp", how="inner")
-    df = df.sort_values("timestamp").reset_index(drop=True)
+def get_spot_data():
+    try:
+        import yfinance as yf
+    except ImportError:
+        print("Error: yfinance not installed.")
+        return pd.DataFrame()
+    
+    ticker = "BTC-USD" if SYMBOL == "BTCUSDT" else "ETH-USD"
+    end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    print(f"Downloading spot data ({ticker})...")
+    
+    for attempt in range(3):
+        try:
+            df = yf.download(ticker, start="2020-01-01", end=end_date, interval="1d", auto_adjust=True, progress=False)
+            if not df.empty:
+                break
+        except Exception as e:
+            print(f"  Attempt {attempt+1} failed: {e}")
+    
+    if df.empty:
+        print("Error: Spot download failed.")
+        return pd.DataFrame()
+    
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.reset_index()
+    df["timestamp"] = pd.to_datetime(df["Date"], utc=True)
+    df = df.rename(columns={"Close": "close"})
+    return df[["timestamp", "close"]]
+
+def run_logic():
+    print("Fetching funding data...")
+    funding = get_funding_data(SYMBOL, 2020)
+    print(f"  Funding rows: {len(funding)}")
+    
+    spot = get_spot_data()
+    if spot.empty:
+        print("Error: No spot data.")
+        return
+    print(f"  Spot rows: {len(spot)}")
+    
+    spot_8h = spot.set_index("timestamp").resample("8h").last().dropna().reset_index()
+    print(f"  Spot 8h rows: {len(spot_8h)}")
+    
+    df = pd.merge(funding, spot_8h, on="timestamp", how="left")
+    df["close"] = df["close"].ffill()
+    df = df.dropna(subset=["close"]).sort_values("timestamp").reset_index(drop=True)
+    print(f"  Merged rows: {len(df)}")
+    
+    if df.empty:
+        print("Error: Merged data empty.")
+        return
     
     df["sma"] = df["close"].rolling(150).mean()
     df["signal"] = np.where(df["close"] > df["sma"], 1, 0)
     df["signal"] = df["signal"].shift(1)
     
     df["trade"] = df["signal"].diff().abs()
-    trade_points = df[df["trade"] != 0].copy()
+    df["funding_ret"] = df["signal"] * df["funding_rate"]
+    df["cost"] = df["trade"] * (TRADE_COST_PCT + SLIPPAGE_ASSUMPTION) * 2
+    df["net_ret"] = df["funding_ret"] - df["cost"]
     
+    trade_points = df[df["trade"] != 0].copy()
     trades = []
     current_equity = INITIAL_CAPITAL
     peak_equity = INITIAL_CAPITAL
@@ -74,52 +108,40 @@ def run_logic_for_symbol(symbol):
     
     for i in range(0, len(trade_points) - 1, 2):
         entry = trade_points.iloc[i]
-        exit = trade_points.iloc[i+1] if (i+1) < len(trade_points) else df.iloc[-1]
+        exit_tp = trade_points.iloc[i+1] if (i+1) < len(trade_points) else df.iloc[-1]
         
         entry_time = entry["timestamp"]
-        exit_time = exit["timestamp"]
+        exit_time = exit_tp["timestamp"]
         entry_price = entry["close"]
-        exit_price = exit["close"]
+        exit_price = exit_tp["close"]
         side = "Long Spot / Short Perp" if entry["signal"] == 1 else "Flat"
+        notional = INITIAL_CAPITAL
         
-        # FIX: Calculate Quantity and Dollar Value
-        quantity = INITIAL_CAPITAL / entry_price
-        notional_value = INITIAL_CAPITAL
-        
-        gross_pnl = 0.0 # Market Neutral
-        
+        gross_pnl = 0.0
         hold_df = df[(df["timestamp"] > entry_time) & (df["timestamp"] <= exit_time)]
-        funding_pnl = hold_df["funding_rate"].sum() * notional_value
-        
-        # FIX: Fees and Slippage based on Dollar Value
-        fees = notional_value * TRADE_COST_PCT * 2 # Entry + Exit
-        slippage = notional_value * SLIPPAGE_ASSUMPTION * 2 # Entry + Exit
-        
+        funding_pnl = hold_df["funding_rate"].sum() * notional
+        fees = notional * TRADE_COST_PCT * 2
+        slippage = notional * SLIPPAGE_ASSUMPTION * 2
         net_pnl = gross_pnl + funding_pnl - fees - slippage
         
-        status = "SUCCESS"
-        if current_equity + net_pnl < 0:
-            net_pnl = -current_equity
-            status = "HALT_NEGATIVE_EQUITY"
-            
         current_equity += net_pnl
         peak_equity = max(peak_equity, current_equity)
         drawdown = ((peak_equity - current_equity) / peak_equity) * 100
         
+        status = "SUCCESS"
         if drawdown > MAX_DRAWDOWN_LIMIT:
             status = "HALT_CIRCUIT_BREAKER"
-            
+        
         trades.append({
             "Trade ID": trade_id,
-            "Symbol": symbol,
+            "Symbol": SYMBOL,
             "Strategy Version": STRATEGY_VERSION,
             "Entry timestamp": str(entry_time),
             "Exit timestamp": str(exit_time),
             "Side": side,
             "Entry price": float(entry_price),
             "Exit price": float(exit_price),
-            "Quantity": float(quantity),
-            "Notional": float(notional_value),
+            "Notional": float(notional),
             "Gross P&L": float(gross_pnl),
             "Funding P&L": float(funding_pnl),
             "Fees": float(fees),
@@ -131,18 +153,23 @@ def run_logic_for_symbol(symbol):
             "Status": status
         })
         trade_id += 1
-
-    log_df = pd.DataFrame(trades)
-    log_file = f"trade_journal_{symbol}.csv"
     
+    cols = ["Trade ID", "Symbol", "Strategy Version", "Entry timestamp", "Exit timestamp",
+            "Side", "Entry price", "Exit price", "Notional", "Gross P&L", "Funding P&L",
+            "Fees", "Slippage", "Net P&L", "Equity after trade", "Drawdown %", "Signal", "Status"]
+    
+    if not trades:
+        print("No trades generated.")
+        pd.DataFrame(columns=cols).to_csv(LOG_FILE, index=False)
+        return
+    
+    log_df = pd.DataFrame(trades)
     if len(log_df) > 50:
         log_df = log_df.tail(50)
-        
-    log_df.to_csv(log_file, mode="w", header=True, index=False)
-    print(f"Trade Journal updated for {symbol} with {len(log_df)} trades.")
+    log_df.to_csv(LOG_FILE, mode="w", header=True, index=False)
+    print(f"Trade Journal: {len(log_df)} trades. Version: {STRATEGY_VERSION}")
 
 if __name__ == "__main__":
-    print("Starting Multi-Symbol Paper Trader (Units Fixed)...")
-    run_logic_for_symbol("BTCUSDT")
-    run_logic_for_symbol("ETHUSDT")
+    print(f"Starting {STRATEGY_VERSION}...")
+    run_logic()
     print("Run complete.")
